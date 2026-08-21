@@ -1,0 +1,491 @@
+from pathlib import Path
+import re, textwrap, shutil, zipfile, os
+
+src = Path("/mnt/data/kakashi_parts")
+head = (src/"head.html").read_text(encoding="utf-8")
+body = (src/"body.html").read_text(encoding="utf-8")
+
+# Build the exact Part 1 + Part 2 page, then replace the old localStorage demo logic
+# with calls to the Flask backend/database.
+html = head + body
+
+# Remove the old DATA STORE through the end of the AUTH functions, then insert backend versions.
+start = html.find("        // ==================== DATA STORE ====================")
+end = html.find("        // ==================== RECEIPT UPLOAD ====================")
+if start == -1 or end == -1:
+    raise RuntimeError("Could not locate JS sections in the supplied parts.")
+
+backend_js = r'''
+        // ==================== DATABASE BACKEND ====================
+        var currentReceiptBase64 = '';
+        var currentOrder = {};
+        var currentFilter = 'all';
+
+        async function api(url, options) {
+            const r = await fetch(url, options || {});
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(data.message || 'Request failed');
+            return data;
+        }
+
+        function showToast(message, type) {
+            type = type || 'success';
+            var container = document.getElementById('toastContainer');
+            var toast = document.createElement('div');
+            toast.className = 'toast ' + type;
+            var icon = type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle';
+            toast.innerHTML = '<i class="fas ' + icon + '"></i><span>' + message + '</span>';
+            container.appendChild(toast);
+            setTimeout(function() {
+                toast.style.animation = 'toastOut 0.3s ease forwards';
+                setTimeout(function() { toast.remove(); }, 300);
+            }, 4000);
+        }
+
+        function openModal(id) {
+            document.getElementById(id).classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+        async function getMe() {
+            try { return await api('/api/me'); } catch(e) { return {user:null}; }
+        }
+
+        async function openAuthModal() { openModal('authModal'); }
+        function closeAuthModal() {
+            closeModal('authModal');
+            document.getElementById('loginEmail').value = '';
+            document.getElementById('loginPassword').value = '';
+        }
+        function switchAuthTab(tab, btn) {
+            var tabs = document.querySelectorAll('.auth-tab');
+            for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+            var panels = document.querySelectorAll('.auth-panel');
+            for (var i = 0; i < panels.length; i++) panels[i].classList.remove('active');
+            if (btn) btn.classList.add('active');
+            else document.querySelectorAll('.auth-tab')[tab === 'login' ? 0 : 1].classList.add('active');
+            document.getElementById(tab + 'Panel').classList.add('active');
+        }
+
+        async function handleRegister() {
+            var firstName = document.getElementById('regFirstName').value.trim();
+            var lastName = document.getElementById('regLastName').value.trim();
+            var email = document.getElementById('regEmail').value.trim();
+            var whatsapp = document.getElementById('regWhatsapp').value.trim();
+            var password = document.getElementById('regPassword').value;
+            var confirmPassword = document.getElementById('regConfirmPassword').value;
+            if (!firstName || !lastName || !email || !whatsapp || !password) return showToast('Please fill all fields','warning');
+            if (password.length < 6) return showToast('Password must be at least 6 characters','warning');
+            if (password !== confirmPassword) return showToast('Passwords do not match','warning');
+            try {
+                await api('/api/register', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({name:firstName+' '+lastName,email,whatsapp,password})
+                });
+                showToast('Account created! Please login.');
+                switchAuthTab('login', null);
+                document.getElementById('loginEmail').value = email;
+            } catch(e) { showToast(e.message,'warning'); }
+        }
+
+        async function handleLogin() {
+            var email = document.getElementById('loginEmail').value.trim();
+            var password = document.getElementById('loginPassword').value;
+            if (!email || !password) return showToast('Please enter email and password','warning');
+            try {
+                var d = await api('/api/login', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({email,password})
+                });
+                updateUIForUser(d.user);
+                closeAuthModal();
+                showToast('Welcome back, ' + d.user.name.split(' ')[0] + '!');
+            } catch(e) { showToast(e.message,'warning'); }
+        }
+
+        async function logout() {
+            await fetch('/api/logout', {method:'POST'});
+            updateUIForUser(null);
+            showToast('Logged out successfully');
+        }
+
+        function updateUIForUser(user) {
+            var loginBtn = document.getElementById('loginBtn');
+            var avatar = document.getElementById('userAvatar');
+            var dropdown = document.getElementById('userDropdown');
+            var adminNav = document.getElementById('adminNavItem');
+            if (user) {
+                loginBtn.style.display = 'none';
+                avatar.style.display = 'flex';
+                avatar.textContent = (user.name || 'U').charAt(0).toUpperCase();
+                var parts = (user.name || 'Member').split(' ');
+                var html = '<div style="padding:12px 20px;border-bottom:1px solid var(--border);">';
+                html += '<div style="font-weight:700;color:var(--text);">' + (user.name || '') + '</div>';
+                html += '<div style="font-size:12px;color:var(--text-muted);">' + (user.email || '') + '</div>';
+                if (user.role === 'admin') html += '<span class="admin-badge">Admin</span>';
+                html += '</div>';
+                html += '<a href="#" onclick="openMemberDashboard(); toggleUserDropdown(); return false;"><i class="fas fa-user-circle"></i> My Orders</a>';
+                if (user.role === 'admin') {
+                    html += '<a href="#" onclick="openAdminModal(); toggleUserDropdown(); return false;"><i class="fas fa-shield-alt"></i> Admin Panel</a>';
+                    adminNav.style.display = 'block';
+                } else adminNav.style.display = 'none';
+                html += '<div class="dropdown-divider"></div>';
+                html += '<button onclick="logout(); toggleUserDropdown();"><i class="fas fa-sign-out-alt"></i> Logout</button>';
+                dropdown.innerHTML = html;
+            } else {
+                loginBtn.style.display = 'block';
+                avatar.style.display = 'none';
+                adminNav.style.display = 'none';
+                dropdown.innerHTML = '';
+            }
+        }
+
+        function toggleUserDropdown() { document.getElementById('userDropdown').classList.toggle('active'); }
+        document.addEventListener('click', function(e) {
+            var dropdown = document.getElementById('userDropdown'), avatar = document.getElementById('userAvatar');
+            if (!dropdown.contains(e.target) && !avatar.contains(e.target)) dropdown.classList.remove('active');
+        });
+
+        function handleReceiptUpload(input) {
+            var file = input.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) { showToast('Please upload an image file','warning'); input.value=''; return; }
+            if (file.size > 2*1024*1024) { showToast('Image must be less than 2MB','warning'); input.value=''; return; }
+            var reader = new FileReader();
+            reader.onload = function(e) {
+                currentReceiptBase64 = e.target.result;
+                var label = document.getElementById('receiptLabel');
+                label.innerHTML = '<i class="fas fa-check-circle" style="font-size:24px;margin-bottom:8px;display:block;"></i>Receipt uploaded: ' + file.name;
+                label.classList.add('has-file');
+                var preview = document.getElementById('receiptPreview');
+                preview.src = currentReceiptBase64; preview.style.display='block';
+                showToast('Receipt uploaded successfully!');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function openOrderModal(packageName, price, bonus) {
+            currentOrder = {package:packageName, price:price, bonus:bonus};
+            document.getElementById('modalPackage').textContent = packageName;
+            document.getElementById('modalPrice').textContent = price;
+            document.getElementById('modalBonus').textContent = bonus;
+            getMe().then(function(d){ document.getElementById('guestContactFields').style.display = d.user ? 'none' : 'block'; });
+            currentReceiptBase64='';
+            document.getElementById('receiptFile').value='';
+            var label=document.getElementById('receiptLabel');
+            label.innerHTML='<i class="fas fa-cloud-upload-alt" style="font-size:24px;margin-bottom:8px;display:block;"></i>Click to upload payment receipt screenshot';
+            label.classList.remove('has-file');
+            document.getElementById('receiptPreview').style.display='none';
+            openModal('orderModal');
+        }
+
+        function closeOrderModal() {
+            closeModal('orderModal');
+            ['playerUid','playerName','guestWhatsapp','guestEmail'].forEach(function(id){document.getElementById(id).value='';});
+            document.getElementById('serverRegion').value='';
+            currentReceiptBase64='';
+            document.getElementById('receiptFile').value='';
+            document.getElementById('receiptPreview').style.display='none';
+        }
+
+        async function placeOrder() {
+            var uid=document.getElementById('playerUid').value.trim();
+            var region=document.getElementById('serverRegion').value;
+            var playerName=document.getElementById('playerName').value.trim();
+            var me=await getMe();
+            var whatsapp=me.user ? me.user.whatsapp : document.getElementById('guestWhatsapp').value.trim();
+            var email=me.user ? me.user.email : document.getElementById('guestEmail').value.trim();
+            var customerName=me.user ? me.user.name : 'Guest';
+            if(!uid) return showToast('Please enter your Free Fire UID','warning');
+            if(!region) return showToast('Please select your server region','warning');
+            if(!whatsapp) return showToast('Please enter your WhatsApp number','warning');
+            if(!email) return showToast('Please enter your email','warning');
+            if(uid.length<8 || isNaN(uid)) return showToast('Please enter a valid UID','warning');
+            if(!currentReceiptBase64) return showToast('Please upload your payment receipt screenshot','warning');
+            try {
+                var d=await api('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({package:currentOrder.package,price:currentOrder.price,bonus:currentOrder.bonus,
+                        uid,region,playerName:playerName||'Unknown',whatsapp,email,customerName,receipt:currentReceiptBase64})});
+                closeOrderModal();
+                showToast('Order '+d.order.id+' placed successfully!');
+                var msg=encodeURIComponent('New Order - Kakashi Topup\n\nOrder ID: '+d.order.id+'\nPackage: '+currentOrder.package+
+                    '\nPrice: '+currentOrder.price+'\nUID: '+uid+'\nServer: '+region+'\nCustomer: '+customerName+
+                    '\nWhatsApp: '+whatsapp+'\nEmail: '+email+'\nIGN: '+(playerName||'Unknown')+'\nReceipt: Uploaded');
+                window.open('https://wa.me/94766559214?text='+msg,'_blank');
+            } catch(e){ showToast(e.message,'warning'); }
+        }
+
+        async function openMemberDashboard() {
+            var me=await getMe();
+            if(!me.user){showToast('Please login first','warning');openAuthModal();return;}
+            try {
+                var d=await api('/api/my-orders');
+                var orders=d.orders||[];
+                document.getElementById('memberTotalOrders').textContent=orders.length;
+                document.getElementById('memberConfirmedOrders').textContent=orders.filter(o=>o.status==='confirmed').length;
+                document.getElementById('memberPendingOrders').textContent=orders.filter(o=>o.status==='pending').length;
+                var list=document.getElementById('memberOrdersList');
+                if(!orders.length){list.innerHTML='<p style="text-align:center;color:var(--text-muted);padding:40px;">No orders yet. Start shopping!</p>';}
+                else {
+                    list.innerHTML=orders.map(function(o){
+                        return '<div class="order-card"><div class="order-card-info"><h4>'+o.package+'</h4><p>Order: '+o.id+' | Server: '+o.region+' | UID: '+o.uid+'</p></div><div class="order-card-status"><div class="date">'+o.created_at+'</div><span class="status-badge status-'+o.status+'">'+o.status+'</span></div></div>';
+                    }).join('');
+                }
+                openModal('memberModal');
+            } catch(e){showToast(e.message,'warning');}
+        }
+
+        async function openAdminModal() {
+            var me=await getMe();
+            if(!me.user || me.user.role!=='admin'){showToast('Admin access only','warning');return;}
+            renderAdminDashboard(); openModal('adminModal');
+        }
+
+        async function renderAdminDashboard() {
+            try {
+                var d=await api('/api/admin/orders?status='+encodeURIComponent(currentFilter));
+                document.getElementById('adminTotalOrders').textContent=d.stats.total;
+                document.getElementById('adminPendingOrders').textContent=d.stats.pending;
+                document.getElementById('adminConfirmedOrders').textContent=d.stats.confirmed;
+                document.getElementById('adminTotalMembers').textContent=d.stats.members;
+                var tbody=document.getElementById('adminOrdersTable');
+                tbody.innerHTML=d.orders.length ? d.orders.map(function(o){
+                    var actions=o.status==='pending'
+                        ? '<button class="btn-confirm" onclick="confirmOrder('+o.id+')"><i class="fas fa-check"></i> Confirm</button><button class="btn-cancel" onclick="cancelOrder('+o.id+')"><i class="fas fa-times"></i></button>'
+                        : '<button class="btn-notify" onclick="notifyCustomer('+o.id+')"><i class="fab fa-whatsapp"></i> Notify</button>';
+                    var receipt=o.receipt ? '<button class="btn-view" onclick="viewReceipt('+o.id+')"><i class="fas fa-receipt"></i> View</button>' : 'No receipt';
+                    return '<tr><td><strong>#'+o.id+'</strong></td><td>'+o.created_at+'</td><td>'+o.customer_name+'<br><small>'+o.whatsapp+'</small></td><td><strong>'+o.package+'</strong><br><small>'+o.bonus+'</small></td><td>'+o.uid+'</td><td>'+o.region+'</td><td><strong>'+o.price+'</strong></td><td>'+receipt+'</td><td><span class="status-badge status-'+o.status+'">'+o.status+'</span></td><td>'+actions+'</td></tr>';
+                }).join('') : '<tr><td colspan="10" style="text-align:center;padding:40px;">No orders found</td></tr>';
+            } catch(e){showToast(e.message,'warning');}
+        }
+        function filterOrders(status){currentFilter=status;renderAdminDashboard();}
+        async function viewReceipt(id){
+            try {var d=await api('/api/admin/order/'+id); if(!d.order.receipt)return showToast('Receipt not found','warning');
+                document.getElementById('receiptModalImg').src=d.order.receipt;
+                document.getElementById('receiptDownloadLink').href=d.order.receipt; openModal('receiptModal');
+            }catch(e){showToast(e.message,'warning');}
+        }
+        async function confirmOrder(id){
+            try {
+                var d=await api('/api/admin/order/'+id+'/confirm',{method:'POST'});
+                renderAdminDashboard(); showToast('Order #'+id+' confirmed!');
+                var o=d.order;
+                var msg=encodeURIComponent('Order Confirmed - Kakashi Topup\n\nHello '+o.customer_name+',\nYour order has been confirmed!\n\nPackage: '+o.package+'\nPrice: '+o.price+'\nOrder ID: #'+o.id+'\nUID: '+o.uid+'\n\nThank you for choosing Kakashi Topup!');
+                window.open('https://wa.me/'+o.whatsapp+'?text='+msg,'_blank');
+                setTimeout(function(){showToast('Email notification prepared for '+o.email,'success');},1000);
+            }catch(e){showToast(e.message,'warning');}
+        }
+        async function cancelOrder(id){
+            if(!confirm('Are you sure you want to cancel this order?'))return;
+            try{await api('/api/admin/order/'+id+'/cancel',{method:'POST'});renderAdminDashboard();showToast('Order cancelled');}
+            catch(e){showToast(e.message,'warning');}
+        }
+        async function notifyCustomer(id){
+            try{var d=await api('/api/admin/order/'+id);var o=d.order;
+                var msg=encodeURIComponent('Kakashi Topup Update\n\nHello '+o.customer_name+',\n\nYour order #'+o.id+' is currently '+o.status.toUpperCase()+'.\nPackage: '+o.package+'\nUID: '+o.uid+'\n\nKakashi Topup Team');
+                window.open('https://wa.me/'+o.whatsapp+'?text='+msg,'_blank');
+            }catch(e){showToast(e.message,'warning');}
+        }
+
+        // Initialize server session UI
+        getMe().then(function(d){ updateUIForUser(d.user); });
+'''
+
+# Replace old script logic before receipt upload.
+html = html[:start] + backend_js + "\n" + html[end:]
+
+# Remove duplicated old receipt/order/admin/navigation/animation JS that comes after backend
+# by cutting at the old navigation marker, then keep the generic navigation/animations portion.
+nav_marker = "        // ==================== NAVIGATION ===================="
+idx = html.find(nav_marker, html.find(backend_js))
+if idx == -1:
+    raise RuntimeError("Navigation marker not found.")
+# Keep from navigation onward, but remove the old init call at the very end because backend init is used.
+tail = html[idx:]
+tail = tail.replace("        // Init\n        updateUIForUser();\n", "")
+html = html[:idx] + tail
+
+# The original part 2 still contains the old receipt/order functions before navigation,
+# but because we inserted backend_js at the start, they were included after it. Remove them.
+receipt_start = html.find("        // ==================== RECEIPT UPLOAD ====================", html.find(backend_js))
+nav_idx = html.find(nav_marker, receipt_start)
+if receipt_start != -1 and nav_idx != -1:
+    html = html[:receipt_start] + html[nav_idx:]
+
+# Create project
+project = Path("/mnt/data/Kakashi_Topup_Integrated")
+if project.exists(): shutil.rmtree(project)
+(project/"templates").mkdir(parents=True)
+(project/"static").mkdir(parents=True)
+(project/"templates"/"index.html").write_text(html, encoding="utf-8")
+
+app = r'''
+import os, sqlite3
+from functools import wraps
+from flask import Flask, render_template, request, session, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET_KEY")
+DB = os.path.join(os.path.dirname(__file__), "database.db")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@kakashi.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+ADMIN_WHATSAPP = "94766559214"
+
+def get_db():
+    con=sqlite3.connect(DB)
+    con.row_factory=sqlite3.Row
+    return con
+
+def init_db():
+    con=get_db()
+    con.execute("""CREATE TABLE IF NOT EXISTS members(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL, whatsapp TEXT NOT NULL,
+        password_hash TEXT NOT NULL, role TEXT DEFAULT 'member',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, member_id INTEGER,
+        customer_name TEXT NOT NULL, whatsapp TEXT NOT NULL, email TEXT NOT NULL,
+        package TEXT NOT NULL, price TEXT NOT NULL, bonus TEXT NOT NULL,
+        uid TEXT NOT NULL, region TEXT NOT NULL, player_name TEXT NOT NULL,
+        receipt TEXT, status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP, confirmed_at TEXT)""")
+    con.commit(); con.close()
+
+def admin_required(fn):
+    @wraps(fn)
+    def w(*a,**k):
+        if session.get("role")!="admin": return jsonify(message="Admin access only"),403
+        return fn(*a,**k)
+    return w
+
+@app.route("/")
+def index(): return render_template("index.html")
+
+@app.get("/api/me")
+def me():
+    if not session.get("member_id"): return jsonify(user=None)
+    return jsonify(user={"id":session["member_id"],"name":session["name"],"email":session["email"],"whatsapp":session["whatsapp"],"role":session["role"]})
+
+@app.post("/api/register")
+def register():
+    d=request.get_json(force=True)
+    name,email,whatsapp,password=(d.get("name","").strip(),d.get("email","").strip().lower(),d.get("whatsapp","").strip(),d.get("password",""))
+    if not all([name,email,whatsapp,password]): return jsonify(message="Please fill all fields"),400
+    if len(password)<6:return jsonify(message="Password must be at least 6 characters"),400
+    con=get_db()
+    try:
+        con.execute("INSERT INTO members(name,email,whatsapp,password_hash) VALUES(?,?,?,?)",(name,email,whatsapp,generate_password_hash(password)))
+        con.commit()
+    except sqlite3.IntegrityError:
+        con.close(); return jsonify(message="Email already registered"),409
+    con.close(); return jsonify(ok=True)
+
+@app.post("/api/login")
+def login():
+    d=request.get_json(force=True); email=d.get("email","").strip().lower(); password=d.get("password","")
+    if email==ADMIN_EMAIL.lower() and password==ADMIN_PASSWORD:
+        session.clear(); session.update(role="admin",member_id=0,name="Admin Kakashi",email=ADMIN_EMAIL,whatsapp=ADMIN_WHATSAPP)
+        return jsonify(user={"id":0,"name":"Admin Kakashi","email":ADMIN_EMAIL,"whatsapp":ADMIN_WHATSAPP,"role":"admin"})
+    con=get_db(); u=con.execute("SELECT * FROM members WHERE email=?",(email,)).fetchone(); con.close()
+    if not u or not check_password_hash(u["password_hash"],password): return jsonify(message="Invalid email or password"),401
+    session.clear(); session.update(role="member",member_id=u["id"],name=u["name"],email=u["email"],whatsapp=u["whatsapp"])
+    return jsonify(user={"id":u["id"],"name":u["name"],"email":u["email"],"whatsapp":u["whatsapp"],"role":"member"})
+
+@app.post("/api/logout")
+def logout(): session.clear(); return jsonify(ok=True)
+
+@app.post("/api/orders")
+def create_order():
+    d=request.get_json(force=True)
+    required=["package","price","bonus","uid","region","playerName","whatsapp","email","customerName"]
+    if not all(str(d.get(k,"")).strip() for k in required): return jsonify(message="Please complete all order fields"),400
+    con=get_db()
+    cur=con.execute("""INSERT INTO orders(member_id,customer_name,whatsapp,email,package,price,bonus,uid,region,player_name,receipt)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(session.get("member_id"),d["customerName"],d["whatsapp"],d["email"],d["package"],d["price"],d["bonus"],d["uid"],d["region"],d["playerName"],d.get("receipt","")))
+    oid=cur.lastrowid; con.commit()
+    o=con.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone(); con.close()
+    return jsonify(order=dict(o))
+
+@app.get("/api/my-orders")
+def my_orders():
+    if session.get("role")!="member": return jsonify(message="Login required"),401
+    con=get_db(); rows=con.execute("SELECT * FROM orders WHERE member_id=? ORDER BY id DESC",(session["member_id"],)).fetchall(); con.close()
+    return jsonify(orders=[dict(r) for r in rows])
+
+def order_row(con,oid): return con.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
+
+@app.get("/api/admin/orders")
+@admin_required
+def admin_orders():
+    status=request.args.get("status","all")
+    con=get_db()
+    q="SELECT * FROM orders"; args=()
+    if status in ("pending","confirmed","cancelled"): q+=" WHERE status=?"; args=(status,)
+    q+=" ORDER BY id DESC"
+    rows=con.execute(q,args).fetchall()
+    stats={"total":con.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+           "pending":con.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0],
+           "confirmed":con.execute("SELECT COUNT(*) FROM orders WHERE status='confirmed'").fetchone()[0],
+           "members":con.execute("SELECT COUNT(*) FROM members").fetchone()[0]}
+    con.close(); return jsonify(orders=[dict(r) for r in rows],stats=stats)
+
+@app.get("/api/admin/order/<int:oid>")
+@admin_required
+def admin_get(oid):
+    con=get_db(); o=order_row(con,oid); con.close()
+    if not o:return jsonify(message="Order not found"),404
+    return jsonify(order=dict(o))
+
+@app.post("/api/admin/order/<int:oid>/<action>")
+@admin_required
+def admin_action(oid,action):
+    status={"confirm":"confirmed","cancel":"cancelled"}.get(action)
+    if not status:return jsonify(message="Invalid action"),400
+    con=get_db(); o=order_row(con,oid)
+    if not o:con.close();return jsonify(message="Order not found"),404
+    con.execute("UPDATE orders SET status=?,confirmed_at=CURRENT_TIMESTAMP WHERE id=?",(status,oid));con.commit()
+    o=order_row(con,oid);con.close();return jsonify(order=dict(o))
+
+if __name__=="__main__":
+    init_db()
+    app.run(debug=True)
+'''
+(project/"app.py").write_text(textwrap.dedent(app).lstrip(), encoding="utf-8")
+(project/"requirements.txt").write_text("Flask>=3.0,<4.0\nWerkzeug>=3.0,<4.0\n", encoding="utf-8")
+(project/"README.txt").write_text("""KAKASHI TOPUP CENTER - Integrated Part 1 + Part 2 + Backend + SQLite
+
+1. Install Python 3.10+.
+2. Open CMD in this folder.
+3. Run: pip install -r requirements.txt
+4. Run: python app.py
+5. Open: http://127.0.0.1:5000
+
+Admin:
+Email: admin@kakashi.com
+Password: admin123
+
+The website design is based on your supplied Part 1 and Part 2. Member accounts,
+orders, statuses, admin statistics and receipt data are stored in SQLite.
+Change the admin password and SECRET_KEY before publishing.
+
+WhatsApp buttons open WhatsApp with the order/customer message. Actual automatic
+server-side WhatsApp delivery and real email sending require API credentials.
+""", encoding="utf-8")
+(project/"run_windows.bat").write_text("@echo off\npython -m pip install -r requirements.txt\npython app.py\npause\n",encoding="utf-8")
+
+# Syntax-check the generated Python and package
+import py_compile
+py_compile.compile(str(project/"app.py"), doraise=True)
+
+zip_path=Path("/mnt/data/Kakashi_Topup_Center_Integrated.zip")
+if zip_path.exists(): zip_path.unlink()
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for p in project.rglob("*"):
+        if p.is_file(): z.write(p,p.relative_to(project))
+print(zip_path, zip_path.stat().st_size)
